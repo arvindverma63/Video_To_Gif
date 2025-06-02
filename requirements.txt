@@ -1,0 +1,5 @@
+Flask==2.3.3
+flasgger==0.9.7.1
+moviepy==1.0.3
+requests==2.31.0
+python-dotenv==1.0.1
