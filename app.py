@@ -1,171 +1,166 @@
-from flask import Flask, send_file, request
-from flask_restx import Api, Resource, fields
-import cv2
-from PIL import Image
+from flask import Flask, request, jsonify
+from flask_swagger_ui import get_swaggerui_blueprint
+from moviepy.editor import VideoFileClip
 import os
 import uuid
-from werkzeug.utils import secure_filename
-import time
-import errno
-import numpy as np
+import requests
+import base64
 
 app = Flask(__name__)
-api = Api(app, version='1.0', title='Video to GIF Converter API',
-          description='API to convert video files to GIFs')
 
-# Define the namespace
-ns = api.namespace('converter', description='Video to GIF conversion operations')
+# Swagger UI setup
+SWAGGER_URL = '/swagger'
+API_URL = '/static/swagger.json'
+swaggerui_blueprint = get_swaggerui_blueprint(
+    SWAGGER_URL,
+    API_URL,
+    config={'app_name': "Video to GIF Converter"}
+)
+app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
 
-# Define the form parameters for Swagger
-video_field = ns.parser()
-video_field.add_argument('video', type='file', location='files', required=True, help='Video file to convert (e.g., .mp4, .avi)')
-video_field.add_argument('fps', type=int, location='form', default=10, help='Frames per second for the GIF (e.g., 10)')
-video_field.add_argument('scale', type=float, location='form', default=0.5, help='Scale factor for GIF resolution (0.0 to 1.0, e.g., 0.5)')
-
-# Directory to store temporary files
+# Directory to store uploaded videos and generated GIFs temporarily
 UPLOAD_FOLDER = 'uploads'
-OUTPUT_FOLDER = 'outputs'
+GIF_FOLDER = 'gifs'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(GIF_FOLDER, exist_ok=True)
 
-def safe_remove(file_path, retries=3, delay=0.5):
-    """Attempt to remove a file with retries in case it's still in use."""
-    for attempt in range(retries):
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return True
-        except OSError as e:
-            if e.errno != errno.EACCES:  # errno.EACCES is "permission denied"
-                raise  # Re-raise if it's a different error
-            if attempt < retries - 1:  # Don't sleep on the last attempt
-                time.sleep(delay)
-    return False
+# ImgBB API key
+IMGBB_API_KEY = "340c70b25e651e2ff88ea1bfa25556c8"
 
-def resize_frame(frame, scale):
-    """Resize a frame (numpy array) by the given scale factor using OpenCV."""
-    if scale == 1.0:
-        return frame
-    height, width = frame.shape[:2]
-    new_height, new_width = int(height * scale), int(width * scale)
-    resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    return resized
+# Maximum GIF size (30 MB in bytes)
+MAX_GIF_SIZE = 30 * 1024 * 1024
 
-def convert_video_to_gif(input_path, output_path, fps=10, scale=0.5):
+@app.route('/convert-to-gif', methods=['POST'])
+def convert_to_gif():
+    """
+    Convert uploaded video to GIF and upload to ImgBB, ensuring GIF is under 30 MB
+    ---
+    tags:
+      - Video Conversion
+    consumes:
+      - multipart/form-data
+    parameters:
+      - in: formData
+        name: video
+        type: file
+        required: true
+        description: Video file to convert to GIF
+    responses:
+      200:
+        description: Successfully converted video to GIF and uploaded to ImgBB
+        schema:
+          type: object
+          properties:
+            success: 
+              type: boolean
+            gif_url:
+              type: string
+      400:
+        description: No video file provided or invalid file
+      500:
+        description: Error during conversion or upload
+    """
+    if 'video' not in request.files:
+        return jsonify({'success': False, 'error': 'No video file provided'}), 400
+    
+    video_file = request.files['video']
+    
+    # Validate file extension
+    if not video_file.filename.lower().endswith(('.mp4', '.avi', '.mov')):
+        return jsonify({'success': False, 'error': 'Invalid video format'}), 400
+
+    # Generate unique filename
+    unique_id = str(uuid.uuid4())
+    video_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_{video_file.filename}")
+    gif_filename = f"{unique_id}.gif"
+    gif_path = os.path.join(GIF_FOLDER, gif_filename)
+
     try:
-        # Open the video file with OpenCV
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            return False, "Could not open video file"
+        # Save uploaded video temporarily
+        video_file.save(video_path)
 
-        # Get the original FPS of the video
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        if original_fps <= 0:
-            original_fps = 30  # Default to 30 if FPS cannot be determined
+        # Convert video to GIF
+        video_clip = VideoFileClip(video_path)
+        
+        # Initial GIF conversion with default settings
+        video_clip.write_gif(gif_path, fps=10)  # Start with reasonable FPS
+        
+        # Check GIF size
+        gif_size = os.path.getsize(gif_path)
+        compression_attempts = 0
+        max_attempts = 3
+        
+        while gif_size > MAX_GIF_SIZE and compression_attempts < max_attempts:
+            compression_attempts += 1
+            # Reduce quality: lower FPS, resolution, or duration
+            fps = max(5, 10 - compression_attempts * 2)  # Reduce FPS (min 5)
+            scale_factor = 1.0 - (compression_attempts * 0.2)  # Reduce resolution by 20% each attempt
+            new_width = int(video_clip.w * scale_factor)
+            new_height = int(video_clip.h * scale_factor)
+            
+            # Ensure even dimensions (required by some codecs)
+            new_width = new_width if new_width % 2 == 0 else new_width - 1
+            new_height = new_height if new_height % 2 == 0 else new_height - 1
+            
+            # Reconvert with compressed settings
+            video_clip_resized = video_clip.resize((new_width, new_height))
+            video_clip_resized.write_gif(gif_path, fps=fps, program='ffmpeg')
+            gif_size = os.path.getsize(gif_path)
+        
+        video_clip.close()
 
-        # Calculate frame step to achieve desired FPS
-        frame_step = max(1, int(original_fps / fps))
+        if gif_size > MAX_GIF_SIZE:
+            raise Exception("Unable to compress GIF below 30 MB after multiple attempts")
 
-        # Read video frames
-        frames = []
-        frame_count = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Delete the uploaded video file
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
-            if frame_count % frame_step == 0:  # Sample frames based on desired FPS
-                # Resize frame
-                resized_frame = resize_frame(frame, scale)
-                # Convert BGR (OpenCV format) to RGB (PIL format)
-                rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
-                # Convert to PIL Image
-                pil_image = Image.fromarray(rgb_frame)
-                frames.append(pil_image)
-
-            frame_count += 1
-
-        # Release the video capture object
-        cap.release()
-
-        if not frames:
-            return False, "No frames extracted from video"
-
-        # Calculate duration per frame in milliseconds
-        duration_per_frame = 1000 / fps  # in milliseconds
-
-        # Save frames as GIF using PIL
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=duration_per_frame,
-            loop=0
+        # Upload GIF to ImgBB
+        with open(gif_path, 'rb') as gif_file:
+            encoded_gif = base64.b64encode(gif_file.read()).decode('utf-8')
+        
+        imgbb_response = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={
+                "key": IMGBB_API_KEY,
+                "image": encoded_gif
+            }
         )
 
-        return True, "Conversion successful"
+        # Check ImgBB response
+        if imgbb_response.status_code != 200:
+            raise Exception(f"ImgBB upload failed: {imgbb_response.text}")
+
+        imgbb_data = imgbb_response.json()
+        if not imgbb_data.get('success'):
+            raise Exception(f"ImgBB upload failed: {imgbb_data.get('error', 'Unknown error')}")
+
+        gif_url = imgbb_data['data']['url']
+
+        # Delete the local GIF file
+        if os.path.exists(gif_path):
+            os.remove(gif_path)
+
+        return jsonify({
+            'success': True,
+            'gif_url': gif_url
+        }), 200
+
     except Exception as e:
-        return False, f"Error converting video to GIF: {str(e)}"
-    finally:
-        # Ensure the video capture is released even if an error occurs
-        if 'cap' in locals() and cap.isOpened():
-            cap.release()
+        # Clean up in case of error
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        if os.path.exists(gif_path):
+            os.remove(gif_path)
+        return jsonify({
+            'success': False,
+            'error': f'Processing failed: {str(e)}'
+        }), 500
 
-@ns.route('/video-to-gif')
-class VideoToGif(Resource):
-    @ns.expect(video_field)
-    @ns.response(200, 'GIF generated successfully', content_type='image/gif')
-    @ns.response(400, 'Invalid input')
-    @ns.response(500, 'Server error')
-    def post(self):
-        if 'video' not in request.files:
-            return {'message': 'No video file provided'}, 400
-
-        video_file = request.files['video']
-        if video_file.filename == '':
-            return {'message': 'No file selected'}, 400
-
-        # Securely save the uploaded file
-        filename = secure_filename(video_file.filename)
-        unique_id = str(uuid.uuid4())
-        input_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_{filename}")
-        video_file.save(input_path)
-
-        # Get optional parameters
-        fps = int(request.form.get('fps', 10))
-        scale = float(request.form.get('scale', 0.5))
-
-        # Validate parameters
-        if fps <= 0 or scale <= 0:
-            safe_remove(input_path)
-            return {'message': 'FPS and scale must be positive'}, 400
-
-        # Generate output path
-        output_filename = f"{unique_id}_output.gif"
-        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
-
-        # Perform conversion
-        success, message = convert_video_to_gif(input_path, output_path, fps, scale)
-        
-        # Clean up input file with retry mechanism
-        if not safe_remove(input_path):
-            return {'message': 'Failed to clean up input file due to access issue'}, 500
-
-        if not success:
-            return {'message': message}, 500
-
-        # Send the GIF file
-        try:
-            response = send_file(output_path, mimetype='image/gif', as_attachment=True, download_name='output.gif')
-            # Clean up output file after sending
-            if not safe_remove(output_path):
-                return {'message': 'Failed to clean up output file due to access issue'}, 500
-            return response
-        except Exception as e:
-            return {'message': f"Error sending GIF: {str(e)}"}, 500
-
-# Add the namespace to the API
-api.add_namespace(ns)
+@app.route('/static/<path:path>')
+def serve_static(path):
+    return app.send_static_file(path)
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False)
